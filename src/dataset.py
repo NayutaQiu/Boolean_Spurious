@@ -1,11 +1,34 @@
-
+import os
+import numpy as np
+import pandas as pd
 import torch
+import sys
+import torchvision.transforms as transforms
+from PIL import Image
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.utils.data.sampler import WeightedRandomSampler
+import random
 from transformers import BertTokenizer
+import wilds
 from utils import *
+from tqdm import tqdm
 from dataset_utils import *
 import math
+import torchvision
+from torchvision.datasets.utils import (
+    extract_archive,
+)
+from sklearn.utils.class_weight import compute_class_weight
+import wget
+from torchvision.transforms import (
+    CenterCrop,
+    Compose,
+    Normalize,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    Resize,
+    ToTensor,
+)
 
 class SpuriousBooleanSampling(IterableDataset):
     def __init__(self, core_len, spurious_len, core_func, spurious_func, c, sample_num, 
@@ -216,3 +239,129 @@ class DominioImage(Dataset):
     
 #     def __getitem__(self, idx):
 #         return self.full_dataset[self.subset_indices[idx]]
+
+class Spuco2Ours(Dataset):
+    def __init__(self, spuco_dataset):
+        super().__init__()
+        self.dataset = spuco_dataset
+        self.n_groups = spuco_dataset.num_spurious * spuco_dataset.num_classes
+        self.n_spurious = spuco_dataset.num_spurious
+        self.n_labels = spuco_dataset.num_classes
+        self.data = spuco_dataset.data.X
+        self.labels = torch.tensor(spuco_dataset.data.labels)
+        self.groups = torch.tensor(spuco_dataset.data.labels) * torch.tensor(spuco_dataset.num_spurious) \
+            + torch.tensor(spuco_dataset.data.spurious)
+        self.spurious = torch.tensor(spuco_dataset.data.spurious)
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, index):
+        x, label = self.dataset[index]
+        g, p = self.groups[index], self.spurious[index]
+        return x,label, g, p
+
+class SpuriousCelebA(Dataset):
+    def __init__(self, basedir, split="train", label="Blond_Hair", spurious="Male"):
+        super().__init__()
+        augmented_transforms = Compose([
+            RandomResizedCrop((224, 224), scale=(0.7, 1.0)),
+            RandomHorizontalFlip(),
+            ToTensor(),
+            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        default_transforms = Compose([
+                    Resize((256, 256)),
+                    CenterCrop((224, 224)),
+                    ToTensor(),
+                    Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                ])
+        if split == "train":
+            transform = augmented_transforms
+        else:
+            transform = default_transforms
+        self.transform = transform
+        self.dataset = torchvision.datasets.CelebA(root=basedir, download=True, split=split, transform=transform)
+        self.n_spurious = 2
+        self.n_groups = 4
+        self.n_labels = 2
+        self.split = split
+        
+        self.labels = torch.tensor(self.dataset.attr[:,  self.dataset.attr_names.index(label)])
+        self.spurious = torch.tensor(self.dataset.attr[:,  self.dataset.attr_names.index(spurious)])
+        self.groups = self.labels * 2 + self.spurious
+    def __len__(self):
+        return len(self.dataset)
+
+    def get_attr_names(self):
+        return self.dataset.attr_names
+
+    def __getitem__(self, idx):
+        img, _ = self.dataset[idx]
+        y,g,p = self.labels[idx], self.groups[idx], self.spurious[idx]
+        return img,y,g,p
+    
+class WaterBirdsDataset(Dataset):
+    # split take values from ["train", "val", "test"]
+    # dataset_type takes values from ["combined", "places", "birds"]
+    def __init__(self, basedir, confounder_strength, splits=["train","test"], transform=None):
+        super().__init__()
+        try:
+            split_i = [["train", "val", "test"].index(split) for split in splits]
+        except ValueError:
+            raise (f"Unknown split {splits} or Unknown type of dataset")
+        
+        dataset_name = f"waterbirds_c{int(confounder_strength*100)}"
+        dataset_dir = os.path.join(basedir, dataset_name)
+        if not check_dataset_completed(dataset_dir):
+            place_dir = os.path.join(basedir, "waterbird_places")
+            cub_dir =  os.path.join(basedir, "CUB_200_2011")
+            original_construct_waterbirds_dataset(basedir, cub_dir = cub_dir, places_dir=place_dir, confounder_strength=confounder_strength,
+                                                  val_frac=0.2, dataset_name=dataset_name)
+        metadata_df = pd.read_csv(os.path.join(dataset_dir, "metadata.csv"))
+        print("dataset total len: ", len(metadata_df))
+        # print(len(metadata_df))
+        self.metadata_df = metadata_df[metadata_df["split"].isin(split_i)]
+        print("dataset size after split: ", len(self.metadata_df))
+        # print(len(self.metadata_df))
+        self.basedir = basedir
+        self.dataset_dir = dataset_dir
+        self.transform = transform
+        self.labels = self.metadata_df['y'].values
+        self.spurious = self.metadata_df['place'].values
+        self.labels = torch.tensor(self.labels)
+        self.spurious = torch.tensor(self.spurious)
+        self.n_labels = 2
+        self.groups = self.labels * 2 + self.spurious
+        self.n_spurious = 2
+        self.n_groups = self.n_labels * self.n_spurious
+        # group_array = y * places + places which classfy the points into different disjoint groups
+        # group 0: y = 0 place = 0 -> landbird on land
+        # group 1: y = 0 place = 1 -> landbird on water
+        # group 2: y = 1 place = 0 -> waterbird on land
+        # group 3: y = 1 place = 1 -> waterbird on water
+        self.n_groups = 4
+        # self.group_counts = (
+        #         torch.arange(self.n_groups).unsqueeze(1) == torch.from_numpy(self.group_array)).sum(1).float()
+        # self.y_counts = (
+        #         torch.arange(self.n_labels).unsqueeze(1) == torch.from_numpy(self.y_array)).sum(1).float()
+        # self.p_counts = (
+        #         torch.arange(self.n_places).unsqueeze(1) == torch.from_numpy(self.p_array)).sum(1).float()
+        self.filename_array = self.metadata_df['img_filename'].values
+        self.data = []
+        for filename in tqdm(self.filename_array):
+            img_path = os.path.join(self.dataset_dir, filename)
+            self.data.append(Image.open(img_path).convert('RGB'))
+
+    def __len__(self):
+        return int(len(self.metadata_df))
+
+    def __getitem__(self, idx):
+        y = self.labels[idx]
+        g = self.groups[idx]
+        p = self.spurious[idx]
+        img = self.data[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, y, g, p
+    
